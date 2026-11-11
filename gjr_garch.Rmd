@@ -1,0 +1,708 @@
+---
+title: "Esercitazione n.1 -- GJR-GARCH(1,1)"
+subtitle: "Metodi e modelli statistici per la finanza -- a.a. 2026/2027"
+author: "[Nome Cognome -- matricola]"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 6, comment = "")
+```
+
+Modello (Glosten, Jagannathan e Runkle, 1993):
+
+$$y_t=\sigma_t z_t,\qquad z_t\sim n.i.d.(0,1)$$
+$$\sigma^2_t=\omega+\alpha\,y^2_{t-1}+\gamma\,d_{t-1}\,y^2_{t-1}+\beta\,\sigma^2_{t-1},\qquad d_{t-1}=1 \text{ se } y_{t-1}<0,\ 0 \text{ altrimenti}$$
+$$V(y_t)=\frac{\omega}{1-\alpha-\gamma/2-\beta}$$
+
+Il codice segue lo schema dei laboratori (es. 16, 18, 24, 25, 27):
+
+* la log-verosimiglianza e le derivate usano le variabili globali `n`, `y2` e `d`, calcolate nelle *operazioni preliminari*;
+* `optim` lavora su `lambda=log(theta)`, così i parametri restano positivi; la stazionarietà è controllata imponendo `l=-10^9` se $\alpha+\gamma/2+\beta\ge 1$;
+* $h_1=\omega/(1-\alpha-\gamma/2-\beta)$ e la log-verosimiglianza è quella condizionata alla prima osservazione, senza la costante $-\frac{n-1}{2}\log 2\pi$;
+* $J$ si stima con l'hessiano analitico (`hessn`) e con quello numerico di `optim`; $I$ con il gradiente della singola osservazione (`gradt`).
+
+
+# Parametri da modificare
+
+Tutte le scelte dell'esercitazione sono qui: per cambiare modello vero, lunghezze o numero di simulazioni basta modificare questo blocco.
+
+```{r parametri}
+options(warn=-1)
+library(numDeriv)
+
+theta0=c(0, 0.05, 0.10, 0.15, 0.75)   # (mi, omega, alpha, gamma, beta) per la generazione
+theta.vero=theta0[2:5]                 # parametri del modello a media nulla da stimare
+parametri=c("omega", "alpha", "gamma", "beta")
+theta.start=c(0.05, 0.05, 0.05, 0.80)  # valori iniziali per optim
+
+n.A=2000                       # lunghezza della serie per il punto a)
+M=200                          # numero di simulazioni Monte Carlo (punto b)
+n.grid=c(500, 1000, 2000, 4000) # lunghezze delle serie (punto b)
+esegui.mc=TRUE                 # FALSE = carica i risultati salvati in mc_gjr.RData
+esegui.mc.t=FALSE              # TRUE = esegue anche il Monte Carlo con innovazioni t
+gdl=8                          # gradi di liberta' per le innovazioni t
+
+set.seed(123)
+```
+
+
+# Funzioni
+
+## Generazione delle serie
+
+Stessa struttura di `tgarch11` (es. 9) e `simgarch11t` (es. 19): `theta[1]` è la media, che nell'esercitazione vale 0. La funzione restituisce la serie e la varianza condizionata vera, come `garch11.sim` dell'es. 4.
+
+```{r simulazione}
+# simgjr genera una serie da un GJR-GARCH(1,1) gaussiano
+# theta=c(mi, omega, alpha, gamma, beta)
+# Restituisce una matrice n x 2: serie e varianza condizionata
+simgjr=function(n,n.start=500,theta=c(0,0.05,0.1,0.15,0.75))
+{
+y=rep(0,(n+n.start))
+s=rep(0,(n+n.start))
+s[1]=theta[2]/(1-theta[3]-theta[4]/2-theta[5])
+y[1]=theta[1]+rnorm(1)*sqrt(s[1])
+for (i in 2:(n+n.start))
+  {
+  s[i]=theta[2]+theta[3]*(y[i-1]-theta[1])^2+
+         theta[4]*(y[i-1]-theta[1]<0)*(y[i-1]-theta[1])^2+
+          theta[5]*s[i-1]
+  y[i]=theta[1]+rnorm(1)*sqrt(s[i])
+  }
+serie=y[(n.start+1):(n+n.start)]
+var.cond=s[(n.start+1):(n+n.start)]
+return(cbind(serie,var.cond))
+}
+
+
+# simgjrt: come simgjr ma con innovazioni t-Student a media 0 e varianza 1
+simgjrt=function(n,n.start=500,gdl=8,theta=c(0,0.05,0.1,0.15,0.75))
+{
+y=rep(0,(n+n.start))
+s=rep(0,(n+n.start))
+t01=rt((n+n.start),df=gdl)*sqrt((gdl-2)/gdl)      # t a media 0 e varianza 1
+s[1]=theta[2]/(1-theta[3]-theta[4]/2-theta[5])
+y[1]=theta[1]+t01[1]*sqrt(s[1])
+for (i in 2:(n+n.start))
+  {
+  s[i]=theta[2]+theta[3]*(y[i-1]-theta[1])^2+
+         theta[4]*(y[i-1]-theta[1]<0)*(y[i-1]-theta[1])^2+
+          theta[5]*s[i-1]
+  y[i]=theta[1]+t01[i]*sqrt(s[i])
+  }
+serie=y[(n.start+1):(n+n.start)]
+var.cond=s[(n.start+1):(n+n.start)]
+return(cbind(serie,var.cond))
+}
+```
+
+## Log-verosimiglianza
+
+Come `lvgarch11` delle esercitazioni: i parametri entrano come `lambda=log(theta)`.
+
+```{r logverosimiglianza}
+# lvgjr restituisce la logverosimiglianza di
+# un GJR-GARCH(1,1) a media nulla per un vettore lambda=log(theta)
+# dei parametri. Usa le variabili globali n, y2, d.
+# Restituisce uno scalare
+lvgjr<-function(lambda)
+{
+omega=exp(lambda[1])
+alpha=exp(lambda[2])
+gamma=exp(lambda[3])
+beta=exp(lambda[4])
+h=rep(0,n)
+h[1]=omega/(1-alpha-gamma/2-beta)
+for (i in 2:n)
+{
+ h[i]=omega+alpha*y2[i-1]+gamma*d[i-1]*y2[i-1]+beta*h[i-1]
+}
+## stima della sola log-lik condiz.
+h=h[2:n]
+y2=y2[2:n]
+l=sum(-0.5*log(h)-0.5*(y2/h))
+### controllo della stazionarieta'
+if (alpha+gamma/2+beta>=1) l=-10^(9)
+return(l)
+}
+```
+
+## Derivate di $\sigma^2_t$
+
+Nelle slide, per il GARCH(1,1), le derivate esatte di $h_t=\sigma^2_t$ sono scritte come somme ($C_1$, $C_2$, $C_3$ per le derivate prime, $C_4$, $C_5$, $C_6$ per le seconde). Qui si usano le stesse quantità, ma calcolate in modo ricorsivo: il risultato è lo stesso e il costo passa da $n^2$ a $n$ operazioni, cosa che conta nelle simulazioni del punto b).
+
+Derivate prime ($c_1,\dots,c_4$ rispetto a $\omega,\alpha,\gamma,\beta$):
+$$\frac{\partial h_t}{\partial\theta}=v_{t-1}+\beta\,\frac{\partial h_{t-1}}{\partial\theta},\qquad v_{t-1}=(1,\;y^2_{t-1},\;d_{t-1}y^2_{t-1},\;h_{t-1})'$$
+ad esempio $c_1(t)=1+\beta c_1(t-1)$, da cui $c_1(t)=\sum_{k=0}^{t-2}\beta^k$, che è proprio la `c1=cumsum(beta^seq(0,(n-2),1))` delle esercitazioni.
+
+Derivate seconde: sono diverse da zero solo quelle che coinvolgono $\beta$ ($c_5,\dots,c_8$ = derivate rispetto a $\omega\beta$, $\alpha\beta$, $\gamma\beta$, $\beta\beta$):
+$$\frac{\partial^2 h_t}{\partial\theta_j\partial\beta}=\frac{\partial h_{t-1}}{\partial\theta_j}+\beta\frac{\partial^2 h_{t-1}}{\partial\theta_j\partial\beta},\qquad \frac{\partial^2 h_t}{\partial\beta^2}=2\frac{\partial h_{t-1}}{\partial\beta}+\beta\frac{\partial^2 h_{t-1}}{\partial\beta^2}$$
+
+Come nelle slide, nel calcolo delle derivate $h_1$ è trattato come un valore iniziale fissato (le derivate partono da zero).
+Con `sempl=TRUE` si ottiene la versione semplificata (condizionata a $I_{t-1}$): $\partial h_t/\partial\theta=v_{t-1}$ e derivate seconde nulle.
+
+```{r derivate}
+# dergjr calcola, per un vettore theta=c(omega,alpha,gamma,beta),
+# la serie h(t) e le derivate prime (c1,...,c4) e seconde (c5,...,c8) di h(t)
+# Usa le variabili globali n, y2, d.
+# Restituisce una lista di vettori di lunghezza n (il primo elemento e' t=1)
+dergjr<-function(theta, sempl=FALSE)
+{
+omega=theta[1]
+alpha=theta[2]
+gamma=theta[3]
+beta=theta[4]
+h=rep(0,n)
+c1=rep(0,n)    # d h(t) / d omega
+c2=rep(0,n)    # d h(t) / d alpha
+c3=rep(0,n)    # d h(t) / d gamma
+c4=rep(0,n)    # d h(t) / d beta
+c5=rep(0,n)    # d2 h(t) / d omega d beta
+c6=rep(0,n)    # d2 h(t) / d alpha d beta
+c7=rep(0,n)    # d2 h(t) / d gamma d beta
+c8=rep(0,n)    # d2 h(t) / d beta^2
+h[1]=omega/(1-alpha-gamma/2-beta)
+for (i in 2:n)
+{
+ h[i]=omega+alpha*y2[i-1]+gamma*d[i-1]*y2[i-1]+beta*h[i-1]
+ if (sempl)
+ {
+  c1[i]=1
+  c2[i]=y2[i-1]
+  c3[i]=d[i-1]*y2[i-1]
+  c4[i]=h[i-1]
+ } else {
+  c1[i]=1+beta*c1[i-1]
+  c2[i]=y2[i-1]+beta*c2[i-1]
+  c3[i]=d[i-1]*y2[i-1]+beta*c3[i-1]
+  c4[i]=h[i-1]+beta*c4[i-1]
+  c5[i]=c1[i-1]+beta*c5[i-1]
+  c6[i]=c2[i-1]+beta*c6[i-1]
+  c7[i]=c3[i-1]+beta*c7[i-1]
+  c8[i]=2*c4[i-1]+beta*c8[i-1]
+ }
+}
+return(list(h=h,c1=c1,c2=c2,c3=c3,c4=c4,c5=c5,c6=c6,c7=c7,c8=c8))
+}
+```
+
+## Gradiente e hessiano analitici
+
+Contributo della singola osservazione al gradiente:
+$$\frac{\partial l_t}{\partial\theta}=-\frac12\,\frac{1}{h_t}\,\frac{\partial h_t}{\partial\theta}+\frac12\,\frac{y_t^2}{h_t^2}\,\frac{\partial h_t}{\partial\theta}$$
+
+Hessiano (formula generale delle slide con media nulla):
+$$\frac{\partial^2 l}{\partial\theta\,\partial\theta'}=\sum_t\left(\frac{1}{2h_t^2}-\frac{y_t^2}{h_t^3}\right)\frac{\partial h_t}{\partial\theta}\frac{\partial h_t}{\partial\theta'}+\sum_t\left(\frac{y_t^2}{2h_t^2}-\frac{1}{2h_t}\right)\frac{\partial^2 h_t}{\partial\theta\,\partial\theta'}$$
+
+```{r gradiente-hessiano}
+# gradt calcola le derivate prime della logverosimiglianza
+# di una singola osservazione per un GJR-GARCH(1,1) a media nulla
+# NB - restituisce una matrice (n-1)x4: una riga per ogni t=2,...,n
+gradt<-function(theta, sempl=FALSE)
+{
+der=dergjr(theta, sempl)
+h=der$h[2:n]
+yy2=y2[2:n]
+# qui non ci sono le sommatorie: vettori con le derivate per ogni t
+dlvomega=-0.5*((1/h)*der$c1[2:n]) + 0.5*((yy2/(h^2))*der$c1[2:n])
+dlvalpha=-0.5*((1/h)*der$c2[2:n]) + 0.5*((yy2/(h^2))*der$c2[2:n])
+dlvgamma=-0.5*((1/h)*der$c3[2:n]) + 0.5*((yy2/(h^2))*der$c3[2:n])
+dlvbeta =-0.5*((1/h)*der$c4[2:n]) + 0.5*((yy2/(h^2))*der$c4[2:n])
+return(cbind(dlvomega,dlvalpha,dlvgamma,dlvbeta))
+}
+
+
+# gradgjr calcola il gradiente della logverosimiglianza rispetto a
+# lambda=log(theta), da passare a optim
+# Restituisce il vettore, quadridimensionale, del gradiente
+gradgjr<-function(lambda)
+{
+theta=exp(lambda)
+dlv=colSums(gradt(theta))     # gradiente rispetto a theta
+return(dlv*theta)             # regola della catena: dl/dlambda = dl/dtheta * theta
+}
+
+
+# hessn calcola la matrice delle derivate seconde della logverosimiglianza
+# dell'intero campione per un GJR-GARCH(1,1) a media nulla
+# Restituisce una matrice 4x4
+hessn<-function(theta, sempl=FALSE)
+{
+der=dergjr(theta, sempl)
+h=der$h[2:n]
+yy2=y2[2:n]
+c1=der$c1[2:n]; c2=der$c2[2:n]; c3=der$c3[2:n]; c4=der$c4[2:n]
+c5=der$c5[2:n]; c6=der$c6[2:n]; c7=der$c7[2:n]; c8=der$c8[2:n]
+
+hess=matrix(0,nrow=4,ncol=4)
+hess[1,1]=0.5*sum((1/(h^2))*(c1^2))-sum((yy2/(h^3))*(c1^2))
+hess[1,2]=0.5*sum((1/(h^2))*c1*c2)-sum((yy2/(h^3))*c1*c2)
+hess[1,3]=0.5*sum((1/(h^2))*c1*c3)-sum((yy2/(h^3))*c1*c3)
+hess[1,4]=0.5*sum((1/(h^2))*c1*c4)-0.5*sum((1/h)*c5)-
+          sum((yy2/(h^3))*c1*c4)+0.5*sum((yy2/(h^2))*c5)
+hess[2,2]=0.5*sum((1/(h^2))*(c2^2))-sum((yy2/(h^3))*(c2^2))
+hess[2,3]=0.5*sum((1/(h^2))*c2*c3)-sum((yy2/(h^3))*c2*c3)
+hess[2,4]=0.5*sum((1/(h^2))*c2*c4)-0.5*sum((1/h)*c6)-
+          sum((yy2/(h^3))*c2*c4)+0.5*sum((yy2/(h^2))*c6)
+hess[3,3]=0.5*sum((1/(h^2))*(c3^2))-sum((yy2/(h^3))*(c3^2))
+hess[3,4]=0.5*sum((1/(h^2))*c3*c4)-0.5*sum((1/h)*c7)-
+          sum((yy2/(h^3))*c3*c4)+0.5*sum((yy2/(h^2))*c7)
+hess[4,4]=0.5*sum((1/(h^2))*(c4^2))-0.5*sum((1/h)*c8)-
+          sum((yy2/(h^3))*(c4^2))+0.5*sum((yy2/(h^2))*c8)
+hess[2,1]=hess[1,2]
+hess[3,1]=hess[1,3]
+hess[4,1]=hess[1,4]
+hess[3,2]=hess[2,3]
+hess[4,2]=hess[2,4]
+hess[4,3]=hess[3,4]
+return(hess)
+}
+```
+
+## Stima ML e QML
+
+La funzione raccoglie i passi che nelle esercitazioni 18 e 24 sono scritti nel programma principale: stima puntuale, $J$ numerico, $J$ analitico, $I$ analitico, matrici di covarianza ML e QML. Usa le variabili globali `y`, `n`, `y2`, `d`.
+
+```{r stima}
+stima.gjr=function(theta.start=c(0.05,0.05,0.05,0.8), gradiente=gradgjr, hess.num=TRUE)
+{
+k=4                       # n.parametri
+
+# ------- stima puntuale ---------------------------------------------
+fit.y=optim(par=log(theta.start),lvgjr,gr=gradiente,method="BFGS",
+            control=list(fnscale=-1,maxit=500),hessian=hess.num)
+theta.hat=exp(fit.y$par)
+
+# ----- calcolo di J con hessiano numerico ----
+varas.ml.num=matrix(NA,k,k)
+if (hess.num)
+{
+q=diag(exp(fit.y$par))
+j0=(solve(q)%*%(-fit.y$hessian)%*%solve(t(q)))/n
+varas.ml.num=solve(j0)/n
+}
+
+# ----- calcolo di J con hessiano analitico ----
+j0=-hessn(theta.hat)/n
+j0meno1=solve(j0)
+varas.ml.ana=j0meno1/n
+
+# -------- calcolo di I con gradiente analitico --------
+dlt=gradt(theta.hat)
+i0=matrix(0,nrow=k,ncol=k)
+for (i in 2:n)
+{
+# %*% significa prodotto vettoriale; t() indica trasposizione
+i0=i0+(dlt[i-1,])%*%t(dlt[i-1,])
+}
+i0=i0/n
+
+# -------- calcolo della matrice di covarianza con QML -------
+varas.qml=(j0meno1 %*% i0 %*% j0meno1)/n
+
+# ----- varianza condizionata e residui standardizzati -----
+h=dergjr(theta.hat)$h
+res.st=y[2:n]/sqrt(h[2:n])
+
+return(list(theta.hat=theta.hat, value=fit.y$value, convergence=fit.y$convergence,
+            varas.ml.num=varas.ml.num, varas.ml.ana=varas.ml.ana, varas.qml=varas.qml,
+            j0=j0, i0=i0, h=h, res.st=res.st))
+}
+
+
+# stampa.tabella stampa stime, standard error, statistica t e p-value
+# (H0: theta_i=0) come nelle esercitazioni
+stampa.tabella=function(theta.hat, varas, titolo)
+{
+riga=paste("-------------", titolo, "-------------")
+names(riga)=" "
+print(riga)
+Coef=theta.hat
+Std.Err=sqrt(diag(varas))
+tstat=Coef/Std.Err
+pval=2*pnorm(abs(tstat),lower.tail=F)
+tabella=data.frame(Coef,Std.Err,tstat,pval)
+rownames(tabella)=parametri
+print(round(tabella,4))
+invisible(tabella)
+}
+```
+
+## Funzioni per la diagnostica
+
+```{r diagnostica-funzioni}
+curtosi=function(x)
+{
+m4=mean((x-mean(x))^4)
+m2=mean((x-mean(x))^2)
+return(m4/m2^2)
+}
+
+asimm=function(x)
+{
+m3=mean((x-mean(x))^3)
+m2=mean((x-mean(x))^2)
+return(m3/m2^1.5)
+}
+
+# test di Jarque e Bera: JB = n*(asimm^2/6 + (curtosi-3)^2/24) ~ chi^2(2)
+# Restituisce statistica test e p-value
+jb.test=function(x)
+{
+n=length(x)
+jb=n*(asimm(x)^2/6+(curtosi(x)-3)^2/24)
+pval=pchisq(jb,df=2,lower.tail=F)
+return(c(JB=jb,p.value=pval))
+}
+```
+
+
+# Punto a) Generazione, stima e diagnostica
+
+## Controllo del generatore
+
+Su una serie molto lunga la varianza campionaria deve essere vicina a $\omega/(1-\alpha-\gamma/2-\beta)$.
+
+```{r controllo-generatore}
+y.lunga=simgjr(n=200000,theta=theta0)[,1]
+var.teor=theta0[2]/(1-theta0[3]-theta0[4]/2-theta0[5])
+cat("Varianza campionaria=",var(y.lunga)," Varianza teorica=",var.teor,"\n")
+```
+
+## Serie simulata
+
+```{r serie-simulata}
+sim=simgjr(n=n.A,n.start=500,theta=theta0)
+y=sim[,1]
+var.cond=sim[,2]
+
+par(mfrow=c(2,2))
+plot(y,type="l",main="serie y")
+plot(var.cond,type="l",main="Varianza condizionata vera")
+acf(y,20)
+acf(y^2,20)
+
+# ----- operazioni preliminari ---------------------------------------
+n=length(y)
+y2=y^2                  # valori di y(t)^2
+d=as.numeric(y<0)       # valori di d(t)=1 se y(t)<0
+```
+
+## Verifica delle derivate analitiche
+
+Le derivate analitiche trattano $h_1$ come fissato, mentre la log-verosimiglianza calcola $h_1=\omega/(1-\alpha-\gamma/2-\beta)$, che dipende da $\theta$. Per un confronto esatto con le derivate numeriche (`numDeriv`) si usa quindi una log-verosimiglianza con $h_1$ fissato. Il confronto con `lvgjr` mostra invece quanto pesa la condizione iniziale.
+
+```{r verifica-derivate}
+theta.prova=theta.vero
+h1.fisso=theta.prova[1]/(1-theta.prova[2]-theta.prova[3]/2-theta.prova[4])
+
+# logverosimiglianza in funzione di theta, con h[1] fissato
+lvgjr.h1=function(theta)
+{
+h=rep(0,n)
+h[1]=h1.fisso
+for (i in 2:n) h[i]=theta[1]+theta[2]*y2[i-1]+theta[3]*d[i-1]*y2[i-1]+theta[4]*h[i-1]
+h=h[2:n]
+return(sum(-0.5*log(h)-0.5*(y2[2:n]/h)))
+}
+
+g.ana=colSums(gradt(theta.prova))
+g.num=grad(func=lvgjr.h1, x=theta.prova)               # libreria numDeriv
+g.num.lv=grad(func=function(th) lvgjr(log(th)), x=theta.prova)
+confronto=rbind(g.ana, g.num, g.num.lv)
+dimnames(confronto)=list(c("analitico","numerico (h1 fisso)","numerico (lvgjr)"), parametri)
+print(confronto)
+
+H.ana=hessn(theta.prova)
+H.num=hessian(func=lvgjr.h1, x=theta.prova)            # libreria numDeriv
+cat("Massima differenza tra hessiano analitico e numerico:", max(abs(H.ana-H.num)), "\n")
+cat("Massimo valore assoluto dell'hessiano:", max(abs(H.ana)), "\n")
+```
+
+## Stima del modello
+
+```{r stima-modello}
+t1=proc.time()
+fit=stima.gjr(theta.start=theta.start, gradiente=gradgjr)
+tempo.ana=proc.time()-t1
+
+t1=proc.time()
+fit.num=stima.gjr(theta.start=theta.start, gradiente=NULL)
+tempo.num=proc.time()-t1
+
+stampa.tabella(fit$theta.hat, fit$varas.ml.num, "Stime ML con hessiano numerico")
+stampa.tabella(fit$theta.hat, fit$varas.ml.ana, "Stime ML con hessiano analitico")
+stampa.tabella(fit$theta.hat, fit$varas.qml, "Stime QML con derivate analitiche")
+
+riga8="------------- Verosim. e convergenza -------------------------"
+names(riga8)=" "
+print(riga8)
+cat("Verosimiglianza in theta.hat=",fit$value,"\n")
+cat("Codice di convergenza=",fit$convergence,"\n")
+cat("Persistenza alpha+gamma/2+beta=",fit$theta.hat[2]+fit$theta.hat[3]/2+fit$theta.hat[4],"\n")
+
+riga9="------------- Gradiente analitico vs numerico in optim ---------"
+names(riga9)=" "
+print(riga9)
+confronto=rbind(fit$theta.hat, fit.num$theta.hat)
+dimnames(confronto)=list(c("derivate analitiche","derivate numeriche"), parametri)
+print(confronto)
+cat("Tempo di stima (s): analitiche=",tempo.ana[3]," numeriche=",tempo.num[3],"\n")
+```
+
+Errori standard con le derivate esatte e con quelle semplificate (es. 15):
+
+```{r se-semplificate}
+varas.sempl=solve(-hessn(fit$theta.hat,sempl=TRUE)/n)/n
+confronto=rbind(sqrt(diag(fit$varas.ml.ana)), sqrt(diag(fit$varas.ml.num)),
+                sqrt(diag(fit$varas.qml)), sqrt(diag(varas.sempl)))
+dimnames(confronto)=list(c("ML analitico","ML numerico","QML","ML semplificato"), parametri)
+print(round(confronto,4))
+```
+
+## Diagnostica
+
+```{r diagnostica}
+h=fit$h
+res.st=fit$res.st
+
+par(mfrow=c(2,2))
+plot(h,type="l",main="Varianza condizionata stimata")
+lines(var.cond,col="red")
+plot(res.st,type="l",main="Residui standardizzati")
+qqnorm(res.st)
+qqline(res.st,col="red")
+acf(res.st^2,20,main="ACF dei residui std. al quadrato")
+
+cat("Media e varianza dei residui standardizzati:", mean(res.st), var(res.st), "\n")
+cat("Asimmetria e curtosi dei residui standardizzati:", asimm(res.st), curtosi(res.st), "\n")
+print(jb.test(res.st))
+Box.test(res.st,lag=10,type="Ljung-Box")
+Box.test(res.st^2,lag=10,type="Ljung-Box")
+```
+
+## Modello mal specificato: innovazioni t
+
+Stessa stima su una serie generata con innovazioni $t$: le stime restano consistenti, ma gli standard error da usare sono quelli QML.
+
+```{r innovazioni-t}
+y=simgjrt(n=n.A,n.start=500,gdl=gdl,theta=theta0)[,1]
+
+# ----- operazioni preliminari ---------------------------------------
+n=length(y)
+y2=y^2                  # valori di y(t)^2
+d=as.numeric(y<0)       # valori di d(t)
+
+fit.t=stima.gjr(theta.start=theta.start)
+stampa.tabella(fit.t$theta.hat, fit.t$varas.ml.ana, "Innovazioni t: stime ML")
+stampa.tabella(fit.t$theta.hat, fit.t$varas.qml, "Innovazioni t: stime QML")
+print(jb.test(fit.t$res.st))
+qqnorm(fit.t$res.st)
+qqline(fit.t$res.st,col="red")
+```
+
+
+# Punto b) Simulazioni Monte Carlo
+
+Per ogni $n$ si generano `M` serie dal modello vero e su ognuna si stima il modello, salvando stime e standard error (schema delle es. 21, 22 e 27). I risultati vengono salvati in `mc_gjr.RData`: dopo la prima esecuzione si può porre `esegui.mc=FALSE` per non ripetere le simulazioni.
+
+```{r montecarlo}
+if (esegui.mc)
+{
+risultati=list()
+for (nn in n.grid)
+{
+coef=matrix(NA,nrow=M,ncol=4)
+se.ml=matrix(NA,nrow=M,ncol=4)
+se.qml=matrix(NA,nrow=M,ncol=4)
+conv=rep(NA,M)
+t1=proc.time()
+for (m in 1:M)
+{
+y=simgjr(n=nn,n.start=500,theta=theta0)[,1]
+
+# ----- operazioni preliminari ---------------------------------------
+n=length(y)
+y2=y^2                  # valori di y(t)^2
+d=as.numeric(y<0)       # valori di d(t)
+
+# ------- stima (senza hessiano numerico, come in es. 21) ------------
+fit.m=try(stima.gjr(theta.start=theta.start, hess.num=FALSE), silent=TRUE)
+if (!inherits(fit.m,"try-error"))
+{
+coef[m,]=fit.m$theta.hat
+se.ml[m,]=sqrt(diag(fit.m$varas.ml.ana))
+se.qml[m,]=sqrt(diag(fit.m$varas.qml))
+conv[m]=fit.m$convergence
+}
+}
+tempo=proc.time()-t1
+cat("n=",nn," completato in",round(tempo[3]),"secondi\n")
+risultati[[as.character(nn)]]=list(n=nn,coef=coef,se.ml=se.ml,se.qml=se.qml,conv=conv)
+}
+save(risultati,file="mc_gjr.RData")
+} else {
+load("mc_gjr.RData")
+}
+
+for (r in risultati)
+cat("n=",r$n," stime non riuscite o non convergenti:",sum(is.na(r$conv) | r$conv!=0),"\n")
+```
+
+## Funzione di sintesi
+
+Per ogni parametro e ogni $n$:
+
+* **$E(\hat\theta)\to\theta$**: media delle stime, distorsione e test $t=(\bar{\hat\theta}-\theta)/(s/\sqrt M)$;
+* **$V(\hat\theta)\to 0$**: varianza empirica, $n\cdot V(\hat\theta)$ (deve stabilizzarsi), deviazione standard empirica contro media degli standard error ML e QML;
+* **$\hat\theta\sim N$**: p-value dei test di Jarque-Bera e Shapiro-Wilk sulle stime, del test di Kolmogorov-Smirnov su $(\hat\theta-\theta)/se$ rispetto alla $N(0,1)$, copertura degli intervalli al 95%.
+
+```{r sintesi-funzione}
+analisi.mc=function(risultati, theta.vero)
+{
+tab=NULL
+for (r in risultati)
+{
+ok=which(r$conv==0)
+M=length(ok)
+for (j in 1:4)
+{
+stime=r$coef[ok,j]
+media=mean(stime)
+dev=sd(stime)
+t.bias=(media-theta.vero[j])/(dev/sqrt(M))
+z=(stime-theta.vero[j])/r$se.ml[ok,j]
+z=z[is.finite(z)]
+zq=(stime-theta.vero[j])/r$se.qml[ok,j]
+zq=zq[is.finite(zq)]
+riga=data.frame(param=parametri[j], n=r$n, M=M, vero=theta.vero[j],
+                media=media, distorsione=media-theta.vero[j],
+                t.bias=t.bias, p.bias=2*pnorm(abs(t.bias),lower.tail=F),
+                var.emp=dev^2, n.var=r$n*dev^2, sd.emp=dev,
+                se.ML=mean(r$se.ml[ok,j],na.rm=T), se.QML=mean(r$se.qml[ok,j],na.rm=T),
+                cop.ML=mean(abs(z)<=qnorm(0.975)), cop.QML=mean(abs(zq)<=qnorm(0.975)),
+                p.JB=jb.test(stime)[2], p.SW=shapiro.test(stime)$p.value,
+                p.KS=ks.test(z,"pnorm")$p.value)
+tab=rbind(tab,riga)
+}
+}
+tab=tab[order(match(tab$param,parametri),tab$n),]
+rownames(tab)=NULL
+return(tab)
+}
+
+tab.mc=analisi.mc(risultati, theta.vero)
+```
+
+## Correttezza asintotica: $E(\hat\theta)\to\theta$
+
+```{r correttezza}
+print(tab.mc[,c("param","n","vero","media","distorsione","t.bias","p.bias")], digits=4)
+```
+
+## Consistenza: $V(\hat\theta)\to 0$
+
+```{r consistenza}
+print(tab.mc[,c("param","n","var.emp","n.var","sd.emp","se.ML","se.QML")], digits=4)
+
+# se V(theta.hat) decresce come 1/n, la pendenza di log(V) su log(n) e' -1
+pendenze=NULL
+for (j in 1:4)
+{
+sub=tab.mc[tab.mc$param==parametri[j],]
+fit.lm=summary(lm(log(var.emp)~log(n),data=sub))
+b=fit.lm$coefficients[2,1]
+se.b=fit.lm$coefficients[2,2]
+t.b=(b+1)/se.b
+pendenze=rbind(pendenze, data.frame(param=parametri[j], pendenza=b, se=se.b,
+               t=t.b, pval=2*pt(abs(t.b),df=nrow(sub)-2,lower.tail=F)))
+}
+print(pendenze, digits=4)
+
+par(mfrow=c(2,2))
+for (j in 1:4)
+{
+dati=lapply(risultati, function(r) r$coef[which(r$conv==0),j])
+boxplot(dati, names=n.grid, xlab="n",
+        main=paste("distribuzione di ",parametri[j]," (vero=",theta.vero[j],")",sep=""))
+abline(h=theta.vero[j], col="red")
+}
+```
+
+## Normalità asintotica
+
+```{r normalita}
+print(tab.mc[,c("param","n","p.JB","p.SW","p.KS","cop.ML","cop.QML")], digits=4)
+
+# istogrammi per il valore di n piu' piccolo e per quello piu' grande
+for (r in risultati[c(1,length(risultati))])
+{
+ok=which(r$conv==0)
+par(mfrow=c(2,2))
+for (j in 1:4)
+{
+stime=r$coef[ok,j]
+hist(stime,30,freq=F,
+     main=paste("distribuzione di ",parametri[j]," (vero=",theta.vero[j],"), n=",r$n,sep=""))
+abline(v=theta.vero[j], col="red")
+curve(dnorm(x,mean=theta.vero[j],sd=mean(r$se.ml[ok,j],na.rm=T)),add=T,col="blue")
+}
+}
+
+# qqplot per il valore di n piu' grande
+r=risultati[[length(risultati)]]
+ok=which(r$conv==0)
+par(mfrow=c(2,2))
+for (j in 1:4)
+{
+qqnorm(r$coef[ok,j], main=paste("QQ-plot di ",parametri[j],", n=",r$n,sep=""))
+qqline(r$coef[ok,j], col="red")
+}
+```
+
+## Estensione: innovazioni t (facoltativa)
+
+Si esegue solo con `esegui.mc.t=TRUE`. Le stime restano consistenti (QML), ma la deviazione standard empirica si avvicina a `se.QML` e non a `se.ML`, e la copertura degli intervalli ML resta sotto il 95%.
+
+```{r montecarlo-t, eval=esegui.mc.t}
+risultati.t=list()
+for (nn in n.grid)
+{
+coef=matrix(NA,nrow=M,ncol=4)
+se.ml=matrix(NA,nrow=M,ncol=4)
+se.qml=matrix(NA,nrow=M,ncol=4)
+conv=rep(NA,M)
+for (m in 1:M)
+{
+y=simgjrt(n=nn,n.start=500,gdl=gdl,theta=theta0)[,1]
+n=length(y)
+y2=y^2
+d=as.numeric(y<0)
+fit.m=try(stima.gjr(theta.start=theta.start, hess.num=FALSE), silent=TRUE)
+if (!inherits(fit.m,"try-error"))
+{
+coef[m,]=fit.m$theta.hat
+se.ml[m,]=sqrt(diag(fit.m$varas.ml.ana))
+se.qml[m,]=sqrt(diag(fit.m$varas.qml))
+conv[m]=fit.m$convergence
+}
+}
+cat("n=",nn," completato\n")
+risultati.t[[as.character(nn)]]=list(n=nn,coef=coef,se.ml=se.ml,se.qml=se.qml,conv=conv)
+}
+save(risultati.t,file="mc_gjr_t.RData")
+
+tab.mc.t=analisi.mc(risultati.t, theta.vero)
+print(tab.mc.t[,c("param","n","distorsione","sd.emp","se.ML","se.QML","cop.ML","cop.QML")], digits=4)
+```
+
+```{r info-sessione}
+sessionInfo()
+```
