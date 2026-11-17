@@ -1,7 +1,7 @@
 ---
-title: "Esercitazione n.1 -- GJR-GARCH(1,1)"
+title: "Lavoro di gruppo -- GJR-GARCH(1,1)"
 subtitle: "Metodi e modelli statistici per la finanza -- a.a. 2026/2027"
-author: "[Nome Cognome -- matricola]"
+author: "[Canale Antonio, Librizzi Stefano, Manfredi Emilio]"
 date: "`r format(Sys.Date(), '%d/%m/%Y')`"
 output:
   html_document:
@@ -21,33 +21,25 @@ $$y_t=\sigma_t z_t,\qquad z_t\sim n.i.d.(0,1)$$
 $$\sigma^2_t=\omega+\alpha\,y^2_{t-1}+\gamma\,d_{t-1}\,y^2_{t-1}+\beta\,\sigma^2_{t-1},\qquad d_{t-1}=1 \text{ se } y_{t-1}<0,\ 0 \text{ altrimenti}$$
 $$V(y_t)=\frac{\omega}{1-\alpha-\gamma/2-\beta}$$
 
-Il codice segue lo schema dei laboratori (es. 16, 18, 24, 25, 27):
+# Definizione dei parametri
 
-* la log-verosimiglianza e le derivate usano le variabili globali `n`, `y2` e `d`, calcolate nelle *operazioni preliminari*;
-* `optim` lavora su `lambda=log(theta)`, così i parametri restano positivi; la stazionarietà è controllata imponendo `l=-10^9` se $\alpha+\gamma/2+\beta\ge 1$;
-* $h_1=\omega/(1-\alpha-\gamma/2-\beta)$ e la log-verosimiglianza è quella condizionata alla prima osservazione, senza la costante $-\frac{n-1}{2}\log 2\pi$;
-* $J$ si stima con l'hessiano analitico (`hessn`) e con quello numerico di `optim`; $I$ con il gradiente della singola osservazione (`gradt`).
-
-
-# Parametri da modificare
-
-Tutte le scelte dell'esercitazione sono qui: per cambiare modello vero, lunghezze o numero di simulazioni basta modificare questo blocco.
+Nel blocco di codice vengono definiti i parametri necessari ad impostare il lavoro: per cambiare modello vero, lunghezze o numero di simulazioni basta modificare questo blocco.
 
 ```{r parametri}
 options(warn=-1)
 library(numDeriv)
 
-theta0=c(0, 0.05, 0.10, 0.15, 0.75)   # (mi, omega, alpha, gamma, beta) per la generazione
-theta.vero=theta0[2:5]                 # parametri del modello a media nulla da stimare
+theta0=c(0, 0.05, 0.10, 0.15, 0.75) # vettore dei parametri
+theta.vero=theta0[2:5] 
 parametri=c("omega", "alpha", "gamma", "beta")
-theta.start=c(0.05, 0.05, 0.05, 0.80)  # valori iniziali per optim
+theta.start=c(0.05, 0.05, 0.05, 0.80)  
 
-n.A=2000                       # lunghezza della serie per il punto a)
-M=200                          # numero di simulazioni Monte Carlo (punto b)
+n.A=2000                       # punto a)
+M=200                          # Monte Carlo (punto b)
 n.grid=c(500, 1000, 2000, 4000) # lunghezze delle serie (punto b)
-esegui.mc=TRUE                 # FALSE = carica i risultati salvati in mc_gjr.RData
-esegui.mc.t=FALSE              # TRUE = esegue anche il Monte Carlo con innovazioni t
-gdl=8                          # gradi di liberta' per le innovazioni t
+esegui.mc=TRUE
+esegui.mc.t=FALSE           
+gdl=8                          # gdl per le innovazioni
 
 set.seed(123)
 ```
@@ -57,7 +49,7 @@ set.seed(123)
 
 ## Generazione delle serie
 
-Stessa struttura di `tgarch11` (es. 9) e `simgarch11t` (es. 19): `theta[1]` è la media, che nell'esercitazione vale 0. La funzione restituisce la serie e la varianza condizionata vera, come `garch11.sim` dell'es. 4.
+Di seguito vengono riportate le funzioni richieste: `theta[1]` è la media, che viene posta a zero come da consegna. La funzione restituisce la serie e la varianza condizionata vera.
 
 ```{r simulazione}
 # simgjr genera una serie da un GJR-GARCH(1,1) gaussiano
@@ -105,13 +97,9 @@ return(cbind(serie,var.cond))
 
 ## Log-verosimiglianza
 
-Come `lvgarch11` delle esercitazioni: i parametri entrano come `lambda=log(theta)`.
+I parametri entrano come `lambda=log(theta)`. `lvgjr` restituisce la log-verosimiglianza di un GJR-GARCH(1,1) a media nulla per un vettore `lambda=log(theta)` dei parametri.Le variabili globali `n`, `y2`, `d` verranno definite in seguito.  L'output della funzione è uno scalare.
 
 ```{r logverosimiglianza}
-# lvgjr restituisce la logverosimiglianza di
-# un GJR-GARCH(1,1) a media nulla per un vettore lambda=log(theta)
-# dei parametri. Usa le variabili globali n, y2, d.
-# Restituisce uno scalare
 lvgjr<-function(lambda)
 {
 omega=exp(lambda[1])
